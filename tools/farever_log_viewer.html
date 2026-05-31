@@ -373,9 +373,10 @@ input[type=file]{display:none}
   <div class="dropzone" id="dz"
     ondragover="dzO(event)" ondragleave="dzL()" ondrop="dzD(event)"
     onclick="document.getElementById('fIn').click()">
-    <h3>Drop log files to begin</h3>
-    <p>Drag <strong>.log</strong> files from<br>
-    <code>Farever\dps-meter\logs</code></p>
+    <h3>Drop your log file to begin</h3>
+    <p>Load <code>farever_logger.store.lua</code> (the larger file)<br>
+    from <code>Farever\data\plugins</code>, or a Companion <strong>.log</strong></p>
+    <p id="dzMsg" style="display:none;margin-top:14px;color:var(--gold);font-size:13px"></p>
   </div>
   <div id="mc"></div>
 </div>
@@ -930,12 +931,22 @@ function parseSTORE(text,fname){
 async function handleFiles(files){
   if(!files||!files.length)return;
   document.getElementById('loadBar').style.display='block';
+  const before=allSessions.length; let badPlugin=0, emptyStore=0;
   for(const file of Array.from(files)){
     const text=await file.text(),ext=file.name.split('.').pop().toLowerCase();
+    // Detect the common mistake: loading the PLUGIN file instead of its log.
+    // The plugin is the small farever_logger.lua (Lua code, no flog_ keys);
+    // the log is the larger farever_logger.store.lua (has ["flog_N"]= entries).
+    const isStore=/\["flog_\d+"\]\s*=/.test(text);
+    const looksLikePlugin=ext==='lua' && !isStore &&
+      /function\s+on_render|farever\.store|imgui\./.test(text);
+    if(looksLikePlugin){ badPlugin++; continue; }
     try{
       if(ext==='log'){const s=parseLOG(text,file.name);if(s&&!allSessions.find(x=>x.log_file===s.log_file))allSessions.push(s);}
-      else if(ext==='lua'||/\["flog_\d+"\]\s*=/.test(text)){
-        const s=parseSTORE(text,file.name);if(s&&!allSessions.find(x=>x.log_file===s.log_file))allSessions.push(s);}
+      else if(ext==='lua'||isStore){
+        const s=parseSTORE(text,file.name);
+        if(s&&s.fight_count>0&&!allSessions.find(x=>x.log_file===s.log_file))allSessions.push(s);
+        else if(s&&s.fight_count===0) emptyStore++;}
       else if(ext==='json'){
         const d=JSON.parse(text);
         if(d.sessions)d.sessions.forEach(s=>{if(!allSessions.find(x=>x.log_file===s.log_file)){allSessions.push(s);totalEvents+=(s.event_count||0);}});
@@ -944,6 +955,18 @@ async function handleFiles(files){
   }
   allSessions.sort((a,b)=>a.label.localeCompare(b.label));
   document.getElementById('loadBar').style.display='none';
+  // If nothing new loaded, explain why instead of leaving a blank screen.
+  if(allSessions.length===before){
+    const dz=document.getElementById('dz'); dz.style.display='block';
+    const msg=document.getElementById('dzMsg');
+    if(msg){
+      if(badPlugin) msg.innerHTML='That looks like the <b>plugin</b> file (farever_logger.lua). Load the <b>log</b> instead: the larger <code>farever_logger.store.lua</code>.';
+      else if(emptyStore) msg.innerHTML='That log file has no recorded fights yet. Fight something in-game, then load <code>farever_logger.store.lua</code> again.';
+      else msg.innerHTML='Couldn\'t read any fights from that file. Make sure it\'s a <code>.store.lua</code> log or a Companion <code>.log</code>.';
+      msg.style.display='block';
+    }
+    return;
+  }
   document.getElementById('dz').style.display='none';
   updateBadges();buildPlrBtns();renderSB();
   if(!currentFight){
