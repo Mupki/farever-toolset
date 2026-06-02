@@ -27,7 +27,7 @@
 --    and base-only stats (clearly labelled stats_base_only — real stats live in
 --    UnitAttributes MapData which the mod does not expose to plugins).
 --
--- Segmentation: game combat-state (in_combat) with 8s-gap fallback; continuous autosave, safe delete.
+-- Segmentation: defers to the mod's own fight_start/fight_end events (spans boss phases); 30s fallback only if events never fire.
 -- The "dbg/decode KEPT ..." prefix stays byte-compatible with the viewer; new
 -- fields/lines are appended and ignored by the current parser until we add them.
 --
@@ -284,30 +284,28 @@ local function flush_fight()
   buf = nil
 end
 
--- Decide whether to close the open fight. Primary signal is the game's combat
--- flag: once we've been out of combat for COMBAT_GRACE seconds, the fight is
--- done. If in_combat() isn't readable, fall back to the old damage-gap rule.
+-- Fight segmentation now defers to the MOD's own fight boundaries: the mod
+-- fires fight_start / fight_end events (the same pull lifetime its DPS meter
+-- and boss timer use), which correctly span boss phases and downtime. We open
+-- on fight_start, close on fight_end. The combat/gap logic below is only a
+-- DEEP fallback for the case where those events never arrive (e.g. an old
+-- Companion-style stream): a long inactivity timeout so it can never race the
+-- mod's real boundaries mid-fight.
+local saw_fight_events = false   -- set true once we see a real fight_start/end
+local FALLBACK_GAP = 30.0        -- only used when no fight events ever fire
+
 local function gap_close()
   if not buf then return end
-  local now = farever.now()
-  local ic = in_combat()
-  if ic == nil then
-    -- fallback: no combat flag available, use the damage-gap heuristic
-    if (now - buf.last) > GAP then flush_fight() end
-    return
-  end
-  if ic then
-    buf.out_since = nil          -- still fighting; clear any pending close
-  else
-    buf.out_since = buf.out_since or now
-    if (now - buf.out_since) > COMBAT_GRACE then flush_fight() end
-  end
+  if saw_fight_events then return end   -- mod drives boundaries; don't interfere
+  -- fallback only: close after a long inactivity window
+  if (farever.now() - buf.last) > FALLBACK_GAP then flush_fight() end
 end
 
 -- ---------- lifecycle ----------
 -- Read the character name from the game. As of farever-mod v1.1.2,
--- farever.player.name() returns the current character name; earlier builds
--- had no name getter, so we fall back to the stored/manual value if absent.
+-- farever.player.name() (v1.1.2+) returns the current character name. We try
+-- it first; the extra names are harmless fallbacks for older mod builds. Also
+-- catches character swaps (returns the new name) so logs are attributed right.
 local function auto_char_name()
   local p = farever.player
   if not p then return "" end
@@ -341,7 +339,12 @@ function on_event(name, data)
     local auto = auto_char_name()
     if auto ~= "" then CHAR_NAME = auto; farever.store.set("char_name", auto) end
   end
-  if name == "damage_dealt" then
+  if name == "fight_start" then
+    -- Mod's authoritative pull start. Close any stale buffer, open a fresh one.
+    saw_fight_events = true
+    if buf then flush_fight() end
+    open_fight()
+  elseif name == "damage_dealt" then
     if not buf then open_fight() end
     if not buf.snap_good then refine_snapshot() end
     local now = farever.now()
@@ -377,6 +380,7 @@ function on_event(name, data)
     if buf then table.insert(buf.lines, string.format('%s WEAPONCHANGE %s level=%d upgrade=%d',
       nowstamp(), jstr(data and data.kind or ""), (data and data.level) or 0, (data and data.upgrade) or 0)) end
   elseif name == "fight_end" then
+    saw_fight_events = true
     flush_fight()
   end
 end
@@ -386,12 +390,17 @@ function on_render()
   gap_close()
   if buf and not buf.snap_good then refine_snapshot() end
 
-  imgui.text("Farever Logger v4 - comprehensive capture")
+  imgui.text("Farever Logger v5 - comprehensive capture")
   imgui.separator()
 
-  local nm, changed = imgui.input_text("Character name (auto; edit to override)", CHAR_NAME)
-  if changed then CHAR_NAME = nm; farever.store.set("char_name", nm) end
-  imgui.text("(type once - it is remembered across sessions)")
+  -- Name is read automatically from farever.player.name() (v1.1.2+); no manual
+  -- entry needed. Re-checked each frame so a character swap updates it.
+  local live = auto_char_name()
+  if live ~= "" and live ~= CHAR_NAME then
+    CHAR_NAME = live
+    farever.store.set("char_name", live)
+  end
+  imgui.text("Character: " .. (CHAR_NAME ~= "" and CHAR_NAME or "(detecting...)"))
 
   imgui.spacing()
   imgui.text(buf and "Status: RECORDING (autosaving to disk)" or "Status: idle")
