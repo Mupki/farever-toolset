@@ -663,14 +663,18 @@ function pOpt(s){const m=s.match(/^Some\("(.*)"\)$/);return m?m[1]:null;}
 function parseLOG(text,fname){
   const fromLogger=/\bSNAPSHOT \{/.test(text); // our plugin emits SNAPSHOT lines; Companion does not
   const lines=text.split('\n'),raw=[];
-  for(const line of lines){
+  for(let line of lines){
+    // strip and capture the logger fight-index tag (#FLOG:N\t...) if present
+    let flog=null;
+    const fm=line.match(/^#FLOG:(\d+)\t/);
+    if(fm){ flog=parseInt(fm[1]); line=line.slice(fm[0].length); }
     const tm=line.match(TS_RE);if(!tm)continue;
     const ts=new Date(tm[1].replace(' ','T')+'Z').getTime();
     const km=line.match(KEPT_RE);
     if(km){
       const sn=pOpt(km[2]),sk=pOpt(km[5]);if(!sn||!sk)continue;
       const thp=line.match(/tgt_hp=(\d+)/),tpct=line.match(/tgt_pct=([\d.]+)/); // v4 fields (optional)
-      raw.push({ts,ts_str:tm[1],
+      raw.push({ts,ts_str:tm[1],flog,
         sn,sk,ta:km[3],tn:pOpt(km[4]),aff:pOpt(km[6]),eff:parseInt(km[7]),
         amt:parseFloat(km[8]),crit:km[9]==='true',kill:km[10]==='true',
         thp:thp?+thp[1]:null,tpct:tpct?+tpct[1]:null});
@@ -681,7 +685,7 @@ function parseLOG(text,fname){
     const hm=line.match(HEAL_RE);
     if(hm){
       const sn=pOpt(hm[1]),sk=pOpt(hm[2]);if(!sn||!sk)continue;
-      raw.push({ts,ts_str:tm[1],sn,sk,ta:'self',tn:sn,aff:null,eff:1,heal:true,
+      raw.push({ts,ts_str:tm[1],flog,sn,sk,ta:'self',tn:sn,aff:null,eff:1,heal:true,
         amt:parseFloat(hm[3]),crit:hm[4]==='true',kill:false,thp:null,tpct:null});
     }
   }
@@ -697,17 +701,35 @@ function parseLOG(text,fname){
   // keys out of sequence; logger timestamps can interleave). Sort by time before
   // segmenting, or the gap logic shatters fights and produces negative durations.
   deduped.sort((a,b)=>a.ts-b.ts);
-  const rawSegs=[[deduped[0]]];
-  for(let i=1;i<deduped.length;i++){
-    if((deduped[i].ts-deduped[i-1].ts)/1000>8)rawSegs.push([]);
-    rawSegs[rawSegs.length-1].push(deduped[i]);
+  // If events carry the logger's own fight index (#FLOG:N), trust it: the logger
+  // already decided fight boundaries by deferring to the mod's fight_start/
+  // fight_end events, which correctly span boss phases. Group by flog index and
+  // skip the gap-based re-segmentation (which would shatter untargeted bosses).
+  const hasFlog=deduped.some(e=>e.flog!=null);
+  let rawSegs;
+  if(hasFlog){
+    const byFlog=new Map();
+    for(const ev of deduped){
+      const k=ev.flog==null?-1:ev.flog;
+      if(!byFlog.has(k))byFlog.set(k,[]);
+      byFlog.get(k).push(ev);
+    }
+    rawSegs=[...byFlog.values()];
+  } else {
+    rawSegs=[[deduped[0]]];
+    for(let i=1;i<deduped.length;i++){
+      if((deduped[i].ts-deduped[i-1].ts)/1000>8)rawSegs.push([]);
+      rawSegs[rawSegs.length-1].push(deduped[i]);
+    }
   }
   // ── BOSS-KILL BOUNDARY: a boss dying ends the fight on the spot ────────────
   // v4 logs carry a kill flag validated against tgt_pct→0 (100% reliable). When a
   // boss-named target dies, force a segment break right after, so a boss kill
   // can't bleed into the next trash pull even if it's <8s away. Trash kills don't
   // split (only boss aliases), keeping mob packs intact.
-  {
+  // Skipped when hasFlog: the logger's fight_start/fight_end boundaries are
+  // authoritative, so we must not re-split them here.
+  if(!hasFlog){
     const split=[];
     for(const seg of rawSegs){
       let cur=[];
@@ -727,11 +749,14 @@ function parseLOG(text,fname){
   // into sessions wherever they're >MERGE_GAP apart (that separates re-pulls /
   // wipes / multiple clears). Every 8s-segment overlapping a session window is
   // folded into that one encounter; segments touching no boss stay standalone.
+  // Skipped when hasFlog: the logger already grouped events into authoritative
+  // fights, so there is nothing to stitch and stitching could wrongly merge.
+  let segs;
+  if(hasFlog){
+    segs=rawSegs;
+  } else {
   const MERGE_GAP=60;              // s; real phase downtime < this, idle breaks > this
   const BOSS_DMG_THRESHOLD=2000;   // Companion fallback when there are no names
-  // Identify boss addresses. Plugin logs: any address whose name resolves to a
-  // known boss. Companion logs (no names): the sustained high-damage address.
-  // Always exclude the "untargeted" bucket (empty name → one shared address).
   const untargetedAddrs=new Set();
   {
     const hasName={};
@@ -746,7 +771,6 @@ function parseLOG(text,fname){
     Object.entries(td).filter(([,d])=>d>=BOSS_DMG_THRESHOLD).forEach(([a])=>bossAddrs.add(a));
   }
   bossAddrs.forEach(a=>{ if(untargetedAddrs.has(a)) bossAddrs.delete(a); });
-  // Build boss-session windows: [start,end] spans during which a boss is active.
   const windows=[];
   bossAddrs.forEach(addr=>{
     const ts=deduped.filter(ev=>ev.ta===addr && ev.eff===0).map(ev=>ev.ts).sort((a,b)=>a-b);
@@ -758,8 +782,6 @@ function parseLOG(text,fname){
     }
     windows.push([s,last]);
   });
-  // Stitch: a segment joins an encounter if it overlaps (within MERGE_GAP of) a
-  // boss window. Segments sharing a window merge; others stay standalone.
   function windowOf(seg){
     const a=seg[0].ts,b=seg[seg.length-1].ts;
     for(let w=0;w<windows.length;w++){
@@ -776,7 +798,8 @@ function parseLOG(text,fname){
   });
   Object.values(byWin).forEach(evs=>{ evs.sort((a,b)=>a.ts-b.ts); stitched.push(evs); });
   stitched.sort((a,b)=>a[0].ts-b[0].ts);
-  const segs=stitched;
+  segs=stitched;
+  }
   const fights=[];
   let gBase=allSessions.reduce((a,s)=>a+s.fights.length,0)+1;
   segs.forEach(seg=>{
@@ -864,14 +887,38 @@ function parseLOG(text,fname){
       bossLabel=bossMatch?`${bossMatch.name}${bossMatch.ambiguous?'?':''} (${bossMatch.diff})`:null;
       const addNames=bossMatch?bossMatch.adds:[];
       let addIdx=0;
+      // First pass: name targets that have a real id.
+      const namedDmg={};
       sT.forEach(([a,],i)=>{
-        if(fromLogger){ tL[a]='Untargeted'; }       // logger emitted no name for this hit
+        if(fromLogger){
+          const nm=realId[a]?humanizeEnemy(realId[a]):null;
+          tL[a]=nm||'Untargeted';
+          if(nm)namedDmg[nm]=(namedDmg[nm]||0)+(tDmg[a]||0);
+        }
         else if(isBoss&&i===0){ tL[a]=bossLabel||'Boss*'; }
         else if(isBoss){
           if(addNames.length){ tL[a]=addNames[Math.min(addIdx,addNames.length-1)]; addIdx++; }
           else tL[a]=`Add ${i}`;
         } else tL[a]=`Target ${i+1}`;
       });
+      // Boss-only dungeon bosses (e.g. Lady Bee) log the BOSS's hits untargeted
+      // (0x0) even on v1.1.2, while small adds (e.g. Bees_Mokshi) DO get named.
+      // So untargeted should only inherit a named enemy when that enemy is the
+      // dominant damage. When untargeted >> named (boss untargeted + minor adds),
+      // the untargeted block IS the boss - keep it distinct, don't mislabel it
+      // as the add. Untargeted-heavy boss fights stay "Boss (unnamed)".
+      if(fromLogger){
+        let untDmg=0; sT.forEach(([a,])=>{ if(tL[a]==='Untargeted') untDmg+=(tDmg[a]||0); });
+        const topNamed=Object.entries(namedDmg).sort((a,b)=>b[1]-a[1])[0];
+        if(topNamed && topNamed[1] >= untDmg){
+          // a real named target dominates: untargeted strays belong to it
+          for(const a in tL){ if(tL[a]==='Untargeted') tL[a]=topNamed[0]; }
+        } else if(untDmg>0){
+          // boss is the untargeted block; label it clearly instead of "Untargeted"
+          const lbl = isBoss ? 'Boss (unnamed)' : 'Untargeted';
+          for(const a in tL){ if(tL[a]==='Untargeted') tL[a]=lbl; }
+        }
+      }
     }
     allEvts.forEach(e=>{e.tl=tL[e.target]||'?';});
     const totDmg=Object.values(plrs).reduce((a,p)=>a+p.total_damage,0);
@@ -924,17 +971,23 @@ function dzD(e){e.preventDefault();e.stopPropagation();document.getElementById('
 // a Lua table:  return { ["flog_1"]="...", ["flog_2"]="...", ... }.
 // Each flog value is the fight's log text with Lua-escaped quotes/newlines.
 // Convert it back to plain KEPT log lines so parseLOG can read it directly.
+// We prefix every line of fight N with a marker (#FLOG:N) so the parser can
+// keep the logger's own fight boundaries instead of re-segmenting by time gaps.
+// This matters for boss-only fights (e.g. Lady Bee) where the boss is untargeted
+// and has long phase-downtime gaps the old gap logic would shatter.
 function storeToLog(text){
   const out=[];
-  // grab each   ["flog_N"] = "....."   value (non-greedy, allows escaped quotes)
-  const re=/\["flog_\d+"\]\s*=\s*"((?:[^"\\]|\\.)*)"/g;
+  const re=/\["flog_(\d+)"\]\s*=\s*"((?:[^"\\]|\\.)*)"/g;
   let m;
   while((m=re.exec(text))!==null){
-    // reverse Lua string escaping: \n -> newline, \" -> ", \\ -> \, \t -> tab
-    const body=m[1]
+    const fidx=m[1];
+    const body=m[2]
       .replace(/\\n/g,'\n').replace(/\\t/g,'\t')
       .replace(/\\"/g,'"').replace(/\\\\/g,'\\');
-    out.push(body);
+    // tag each non-empty line with its source fight index
+    body.split('\n').forEach(line=>{
+      if(line.trim()) out.push(`#FLOG:${fidx}\t${line}`);
+    });
   }
   return out.join('\n');
 }
