@@ -1,4 +1,18 @@
--- farever_logger.lua  (v4 - comprehensive real-data capture)
+-- ==============================================================
+-- farever_logger.lua
+-- Submitted by @Mupki  (https://github.com/Mupki/farever-toolset)
+-- Tested against farever-mod v1.1.2
+-- License: MIT
+--
+-- Quiet background combat logger: records each fight (skills, damage, heals,
+-- crits, kills, live target HP, buffs/debuffs, casts, gear + party snapshot)
+-- to a store file for the Farever Log Viewer. Read-only; uses only the
+-- documented farever.player / farever.target / farever.party API. The only
+-- os.* calls are os.date / os.time for log timestamps, both guarded (if os ...)
+-- so the plugin runs fine if the sandbox omits the os table.
+-- ==============================================================
+--
+-- farever_logger.lua  (v5 - adds heals, auto name, party, combat-state segmentation)
 -- Quiet background combat logger for the Farever toolset.
 -- Drop into  <game>/data/plugins/  (hot-reloads within ~1s).
 --
@@ -13,14 +27,29 @@
 --    and base-only stats (clearly labelled stats_base_only — real stats live in
 --    UnitAttributes MapData which the mod does not expose to plugins).
 --
--- Kept from v3: 8s-gap self-segmentation, continuous autosave, safe delete.
+-- Segmentation: game combat-state (in_combat) with 8s-gap fallback; continuous autosave, safe delete.
 -- The "dbg/decode KEPT ..." prefix stays byte-compatible with the viewer; new
 -- fields/lines are appended and ignored by the current parser until we add them.
 --
 -- FILE: data/plugins/farever_logger.store.lua   (keys flog_1, flog_2, ...)
 
-local GAP        = 8.0     -- seconds of no damage that ends a fight
+-- Fight segmentation: prefer the game's own combat state (matches how the
+-- in-game meter holds one fight together across phases, lulls and adds).
+-- We only close a fight once combat has been FALSE for COMBAT_GRACE seconds
+-- (covers brief drops, retarget gaps, and heal-tick combat flicker). The GAP
+-- value is a fallback used only when in_combat() can't be read on this build.
+local GAP          = 8.0   -- fallback: seconds of no damage that ends a fight
+local COMBAT_GRACE = 4.0   -- seconds out-of-combat before a fight is closed
 local SAVE_EVERY = 25      -- autosave the open fight every N new hits
+
+-- Read the game's combat flag if exposed; returns nil if unavailable so the
+-- caller can fall back to the damage-gap heuristic.
+local function in_combat()
+  if not (farever and farever.player and farever.player.in_combat) then return nil end
+  local ok, v = pcall(farever.player.in_combat)
+  if ok and type(v) == "boolean" then return v end
+  return nil
+end
 local CHAR_NAME   = ""
 local fight_count = 0      -- highest fight id written
 local buf         = nil    -- current fight, or nil
@@ -119,6 +148,25 @@ local function resources_json()
     safe_num(p.health), safe_num(p.max_health), safe_num(p.shield))
 end
 
+-- v1.1.2: party members now carry class/health/max_health + attr_ok.
+-- Captured for context (who was in the group for a boss fight); attr_ok flags
+-- whether health values had synced (replicated fields can read 0 right after join).
+local function party_json()
+  if not (farever.party and farever.party.list) then return "[]" end
+  local ok, list = pcall(farever.party.list)
+  if not ok or type(list) ~= "table" then return "[]" end
+  local parts = {}
+  for _, m in ipairs(list) do
+    if m and m.name then
+      parts[#parts+1] = string.format(
+        '{"name":%s,"class":%s,"health":%g,"max_health":%g,"attr_ok":%s}',
+        jstr(m.name or ""), jstr(m.class or ""),
+        m.health or 0, m.max_health or 0, tostring(m.attr_ok == true))
+    end
+  end
+  return "[" .. table.concat(parts, ",") .. "]"
+end
+
 local function build_snap(fid, target, maxhp, s)
   local stats = string.format(
     '{"crit":%g,"crit_dmg":%g,"armor_pen":%g,"spell_pen":%g,"fervor":%g,'
@@ -129,12 +177,12 @@ local function build_snap(fid, target, maxhp, s)
   return string.format(
     '%s SNAPSHOT {"fight_id":%d,"char":%s,"level":%d,"target":%s,'
     .. '"target_max_hp":%g,"weapon":%s,"weapon_level":%d,"weapon_upgrade":%d,'
-    .. '"stats_base_only":%s,"gear":%s,"statuses":%s}',
+    .. '"stats_base_only":%s,"gear":%s,"statuses":%s,"party":%s}',
     nowstamp(), fid or 0, jstr(CHAR_NAME ~= "" and CHAR_NAME or "You"),
     s.level, jstr(target), maxhp or 0,
     jstr(safe_str(farever.player.weapon_kind)),
     safe_num(farever.player.weapon_level), safe_num(farever.player.weapon_upgrade),
-    stats, gear_json(), statuses_json())
+    stats, gear_json(), statuses_json(), party_json())
 end
 
 local function refine_snapshot()
@@ -145,6 +193,17 @@ local function refine_snapshot()
   local s, good = read_stats()
   buf.snap = build_snap(buf.fid, buf.target0, buf.maxhp, s)
   if good then buf.snap_good = true end
+end
+
+-- ---------- heal line ----------
+-- v1.1.2 adds on_event("heal_dealt", {skill, amount, is_crit}) for your own
+-- heals. We log it in a parallel format to KEPT so the viewer can total HPS
+-- separately from DPS. No target HP (heals are on allies/self, not the target).
+local function heal_line(skill, amount, is_crit)
+  return string.format(
+    '%s HEAL source_name=Some(%s) skill_name=Some(%s) amount=%.1f crit=%s',
+    nowstamp(), jstr(CHAR_NAME ~= "" and CHAR_NAME or "You"),
+    jstr(skill), amount or 0, tostring(is_crit == true))
 end
 
 -- ---------- damage line ----------
@@ -202,6 +261,8 @@ local function open_fight()
     fid = fight_count + 1, lines = {}, snap = nil, snap_good = false,
     maxhp = 0, first = farever.now(), last = farever.now(),
     total = 0, tdmg = {}, target0 = safe_str(farever.target.name), savedLen = 0,
+    out_since = nil,   -- when combat dropped (for combat-state segmentation)
+    heal_total = 0,    -- v1.1.2: total healing done this fight
   }
   refine_snapshot()
 end
@@ -214,20 +275,59 @@ local function flush_fight()
   for name, dmg in pairs(buf.tdmg) do if dmg > best then best, primary = dmg, name end end
   local dur = buf.last - buf.first
   local dps = dur > 0 and (buf.total / dur) or 0
-  last_summary = string.format("#%d  %s  %.0f dmg / %.1fs / %.0f dps%s",
+  local hps = dur > 0 and ((buf.heal_total or 0) / dur) or 0
+  local healpart = (buf.heal_total or 0) > 0 and string.format("  +%.0f heal / %.0f hps", buf.heal_total, hps) or ""
+  last_summary = string.format("#%d  %s  %.0f dmg / %.1fs / %.0f dps%s%s",
     buf.fid, primary ~= "" and primary or "?", buf.total, dur, dps,
-    buf.snap_good and "" or "  (stats unread)")
+    healpart, buf.snap_good and "" or "  (stats unread)")
   farever.toast(string.format("Saved fight #%d (%.0f dps)", buf.fid, dps))
   buf = nil
 end
 
+-- Decide whether to close the open fight. Primary signal is the game's combat
+-- flag: once we've been out of combat for COMBAT_GRACE seconds, the fight is
+-- done. If in_combat() isn't readable, fall back to the old damage-gap rule.
 local function gap_close()
-  if buf and (farever.now() - buf.last) > GAP then flush_fight() end
+  if not buf then return end
+  local now = farever.now()
+  local ic = in_combat()
+  if ic == nil then
+    -- fallback: no combat flag available, use the damage-gap heuristic
+    if (now - buf.last) > GAP then flush_fight() end
+    return
+  end
+  if ic then
+    buf.out_since = nil          -- still fighting; clear any pending close
+  else
+    buf.out_since = buf.out_since or now
+    if (now - buf.out_since) > COMBAT_GRACE then flush_fight() end
+  end
 end
 
 -- ---------- lifecycle ----------
+-- Read the character name from the game. As of farever-mod v1.1.2,
+-- farever.player.name() returns the current character name; earlier builds
+-- had no name getter, so we fall back to the stored/manual value if absent.
+local function auto_char_name()
+  local p = farever.player
+  if not p then return "" end
+  for _, fn in ipairs({ p.name, p.char_name, p.hero_name, p.display_name }) do
+    if type(fn) == "function" then
+      local ok, v = pcall(fn)
+      if ok and type(v) == "string" and v ~= "" then return v end
+    end
+  end
+  return ""
+end
+
 function on_init()
   CHAR_NAME   = farever.store.get("char_name", "")
+  -- prefer a live auto-detected name when the API exposes one
+  local auto = auto_char_name()
+  if auto ~= "" then
+    CHAR_NAME = auto
+    farever.store.set("char_name", auto)
+  end
   fight_count = farever.store.get("flog_count", 0)
   base_mono   = farever.now()
   base_wall   = (os and os.time and os.time()) or 0
@@ -236,15 +336,32 @@ end
 
 function on_event(name, data)
   gap_close()
+  -- backfill the character name if it wasn't ready at init (player not loaded yet)
+  if CHAR_NAME == "" then
+    local auto = auto_char_name()
+    if auto ~= "" then CHAR_NAME = auto; farever.store.set("char_name", auto) end
+  end
   if name == "damage_dealt" then
     if not buf then open_fight() end
     if not buf.snap_good then refine_snapshot() end
     local now = farever.now()
     local tk = safe_str(farever.target.name); if tk == "" then tk = buf.target0 end
     buf.last  = now
+    buf.out_since = nil
     buf.total = buf.total + (data.amount or 0)
     buf.tdmg[tk] = (buf.tdmg[tk] or 0) + (data.amount or 0)
     table.insert(buf.lines, damage_line(data.skill, data.amount, data.is_crit, data.is_kill, tk))
+    maybe_status(now)
+    if (#buf.lines - (buf.savedLen or 0)) >= SAVE_EVERY then autosave() end
+  elseif name == "heal_dealt" then
+    -- v1.1.2: your own heals. Open/extend a fight and total healing separately.
+    if not buf then open_fight() end
+    if not buf.snap_good then refine_snapshot() end
+    local now = farever.now()
+    buf.last  = now
+    buf.out_since = nil
+    buf.heal_total = (buf.heal_total or 0) + (data.amount or 0)
+    table.insert(buf.lines, heal_line(data.skill, data.amount, data.is_crit))
     maybe_status(now)
     if (#buf.lines - (buf.savedLen or 0)) >= SAVE_EVERY then autosave() end
   elseif name == "target_changed" then
@@ -272,7 +389,7 @@ function on_render()
   imgui.text("Farever Logger v4 - comprehensive capture")
   imgui.separator()
 
-  local nm, changed = imgui.input_text("Character name", CHAR_NAME)
+  local nm, changed = imgui.input_text("Character name (auto; edit to override)", CHAR_NAME)
   if changed then CHAR_NAME = nm; farever.store.set("char_name", nm) end
   imgui.text("(type once - it is remembered across sessions)")
 
